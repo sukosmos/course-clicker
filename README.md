@@ -136,6 +136,8 @@ Enter를 눌러 ARM한 뒤:
 
 목표 시각에 현재 마우스 위치가 한 번 클릭됩니다.
 
+<img width="294" height="206" alt="image" src="https://github.com/user-attachments/assets/1997efd5-361a-4410-976a-6af96ded3954" />
+
 ---
 
 # 중요

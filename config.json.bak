@@ -1,11 +1,13 @@
 {
-  "target_datetime": "2026-08-11 14:57:50",
-  "effective_offset_ms": 100.543,
+  "target_datetime": "2026-08-12 10:00:00",
+  "effective_offset_ms": 109.141,
   "late_margin_ms": 0.0,
   "spin_window_ms": 20,
   "offset_range_ms": [
-    92.74,
-    108.347
+    105.989,
+    112.292
   ],
-  "offset_calibrated_at": "2026-08-11T14:40:08"
+  "offset_calibrated_at": "2026-08-12T09:39:44",
+  "offset_range_width_ms": 6.303,
+  "no_early_offset_ms": 105.989
 }

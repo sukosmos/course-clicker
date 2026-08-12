@@ -1,26 +1,24 @@
 {
-  "target_datetime": "2026-08-12 16:02:16",
-  "effective_offset_ms": 37.324,
+  "target_datetime": "",
+  "effective_offset_ms": 0.0,
+  "no_early_offset_ms": 0.0,
   "late_margin_ms": 0.0,
-  "spin_window_ms": 20,
-  "offset_range_ms": [
-    105.989,
-    112.292
-  ],
-  "offset_calibrated_at": "2026-08-12T09:39:44",
-  "offset_range_width_ms": 6.303,
-  "no_early_offset_ms": 20.861,
+  "spin_window_ms": 20.0,
+  "test_delay_seconds": 8,
+  "alarm": {
+    "enabled": true,
+    "countdown_seconds": 3
+  },
   "calibration": {
     "version": 4,
-    "last_result": {
-      "boundary_low_ms": 21.361,
-      "boundary_high_ms": 53.287,
-      "boundary_gap_ms": 31.926,
-      "boundary_estimate_ms": 37.324,
-      "no_early_offset_ms": 20.861,
-      "attempts": 8,
-      "confirmation_early_count": 0,
-      "calibrated_at": "2026-08-12T16:01:09"
-    }
+    "max_attempts": 8,
+    "target_gap_ms": 2.0,
+    "guard_ms": 0.5,
+    "backoff_ms": 1.0,
+    "quick_initial_step_ms": 8.0,
+    "full_initial_step_ms": 128.0,
+    "default_guess_ms": 2000.0,
+    "prepare_seconds": 5.0,
+    "last_result": {}
   }
 }

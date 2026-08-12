@@ -229,6 +229,7 @@ jobs:
             "release/CourseClicker-Windows-x64.zip" \
             "release/CourseClicker-macOS-Apple-Silicon.zip" \
             "release/CourseClicker-macOS-Intel.zip" \
+            --repo sukosmos/course-clicker \
             --verify-tag \
             --generate-notes \
             --title "Course Clicker ${{ github.ref_name }}"

@@ -314,8 +314,7 @@ def normal_mode(config):
     )
 
     print(
-        "중단: Ctrl+C 또는 "
-        "마우스를 화면 모서리로 이동"
+        "중단: Ctrl+C "
     )
 
     print()

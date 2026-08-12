@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "no_early_offset_ms": 0.0,
     "late_margin_ms": 0.0,
     "spin_window_ms": 20.0,
+    "test_delay_seconds": 8,
     "alarm": {
         "enabled": True,
         "countdown_seconds": 3,

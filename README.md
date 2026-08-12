@@ -51,6 +51,9 @@ pip install pyautogui
 
 각 PC/네트워크마다 delay가 다르므로 **각자 calibration을 해야 합니다.**
 
+<img width="426" height="162" alt="image" src="https://github.com/user-attachments/assets/5189b1cb-f0ec-46fa-acaf-f4375957e37a" />
+
+
 ```bash
 python calibrate.py
 ```

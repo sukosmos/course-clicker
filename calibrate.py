@@ -1,314 +1,330 @@
+# v4
+import argparse
 import csv
-import json
+import multiprocessing as mp
 import shutil
-import time
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime
 from pathlib import Path
 
-import pyautogui
+from utils import (
+    CONFIG_PATH,
+    classify_boundary,
+    cleanup_countdown,
+    closest_server_datetime,
+    future_wall_ns_with_fraction,
+    load_config,
+    precise_click,
+    prewarm_input,
+    save_config,
+    start_countdown,
+)
 
 
-CONFIG_PATH = Path(__file__).with_name("config.json")
-CSV_PATH = Path(__file__).with_name("calibration_v2.csv")
-BACKUP_PATH = Path(__file__).with_name("config.json.bak")
+BACKUP_PATH = Path(__file__).with_name(
+    "config.json.bak"
+)
 
-# 초기 검증 횟수
-BASELINE_TRIALS = 5
-
-# 최종적으로 이 폭 이하까지 좁히기
-TARGET_WIDTH_MS = 10.0
-
-# 전체 최대 테스트 횟수
-MAX_TRIALS = 15
-
-# Enter 누른 뒤 브라우저로 돌아갈 시간
-PREPARE_SECONDS = 6
-
-# 너무 초 경계 바로 옆에 클릭하는 것을 피함
-BOUNDARY_GUARD_MS = 3.0
+CSV_PATH = Path(__file__).with_name(
+    "calibration_v4.csv"
+)
 
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0
-
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-
-def backup_config():
-    if CONFIG_PATH.exists():
-        shutil.copy2(CONFIG_PATH, BACKUP_PATH)
-
-
-def wait_until_ns(target_ns, spin_window_ms=20):
-    spin_ns = int(spin_window_ms * 1_000_000)
-
-    while True:
-        now_ns = time.time_ns()
-        remain_ns = target_ns - now_ns
-
-        if remain_ns <= 0:
-            return
-
-        if remain_ns > 1_000_000_000:
-            time.sleep(0.2)
-
-        elif remain_ns > 100_000_000:
-            time.sleep(0.01)
-
-        elif remain_ns > spin_ns:
-            time.sleep(
-                (remain_ns - spin_ns)
-                / 1_000_000_000
-            )
-
-        else:
-            # 마지막 구간은 busy wait
-            pass
-
-
-def closest_server_datetime(server_hms, local_call_ns):
-    hh, mm, ss = map(int, server_hms.split(":"))
-
-    local_dt = datetime.fromtimestamp(
-        local_call_ns / 1_000_000_000
-    )
-
-    candidates = []
-
-    for day_delta in (-1, 0, 1):
-        date = local_dt.date() + timedelta(days=day_delta)
-
-        candidate = datetime.combine(
-            date,
-            dt_time(hh, mm, ss)
-        )
-
-        candidates.append(candidate)
-
-    return min(
-        candidates,
-        key=lambda dt: abs(
-            dt.timestamp() - local_dt.timestamp()
-        )
-    )
-
-
-def calculate_delay_interval(local_call_ns, server_hms):
-    """
-    서버가 HH:MM:SS만 표시한다고 가정.
-
-    예:
-      local click = 14:57:49.899
-      server      = 14:57:52
-
-    실제 서버 이벤트 시각은
-
-      [14:57:52.000, 14:57:53.000)
-
-    따라서 effective delay는
-
-      [2101ms, 3101ms)
-    """
-
-    local_sec = local_call_ns / 1_000_000_000
-
-    server_dt = closest_server_datetime(
-        server_hms,
-        local_call_ns
-    )
-
-    server_sec = server_dt.timestamp()
-
-    lower_ms = (
-        server_sec - local_sec
-    ) * 1000
-
-    upper_ms = lower_ms + 1000
-
-    return lower_ms, upper_ms
-
-
-def make_target_ns(fraction_ms):
-    now_ns = time.time_ns()
-
-    current_sec = (
-        now_ns // 1_000_000_000
-    )
-
-    target_sec = (
-        current_sec + PREPARE_SECONDS
-    )
-
-    return (
-        target_sec * 1_000_000_000
-        + int(fraction_ms * 1_000_000)
-    )
-
-
-def choose_next_fraction(low_ms, high_ms):
-    """
-    현재 delay 범위 중앙이
-    서버의 초 경계 근처에 오도록 클릭 fraction을 선택.
-
-    binary search와 비슷한 역할.
-    """
-
-    midpoint = (
-        low_ms + high_ms
-    ) / 2.0
-
-    fraction = (
-        -midpoint
-    ) % 1000.0
-
-    if fraction < BOUNDARY_GUARD_MS:
-        fraction = BOUNDARY_GUARD_MS
-
-    if fraction > 1000 - BOUNDARY_GUARD_MS:
-        fraction = (
-            1000 - BOUNDARY_GUARD_MS
-        )
-
-    return fraction
-
-
-def append_csv(
-    trial,
-    target_ns,
-    call_ns,
-    return_ns,
-    server_hms,
-    sample_low,
-    sample_high,
-    common_low,
-    common_high,
-):
+def append_log(row):
     exists = CSV_PATH.exists()
+
+    fields = [
+        "attempt",
+        "phase",
+        "candidate_ms",
+        "actual_threshold_ms",
+        "result",
+        "target_local",
+        "click_call",
+        "trigger_error_ms",
+        "click_duration_ms",
+        "server_time",
+    ]
 
     with open(
         CSV_PATH,
         "a",
         newline="",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as f:
-
-        writer = csv.writer(f)
-
-        if not exists:
-            writer.writerow([
-                "trial",
-                "target_local",
-                "click_call",
-                "click_return",
-                "click_duration_ms",
-                "server_display",
-                "sample_low_ms",
-                "sample_high_ms",
-                "common_low_ms",
-                "common_high_ms",
-            ])
-
-        target_dt = datetime.fromtimestamp(
-            target_ns / 1e9
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields
         )
 
-        call_dt = datetime.fromtimestamp(
+        if not exists:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
+def get_alarm_settings(
+    config,
+    no_beep
+):
+    alarm = config.get(
+        "alarm",
+        {}
+    )
+
+    enabled = bool(
+        alarm.get(
+            "enabled",
+            True
+        )
+    )
+
+    if no_beep:
+        enabled = False
+
+    countdown = int(
+        alarm.get(
+            "countdown_seconds",
+            3
+        )
+    )
+
+    return enabled, countdown
+
+
+def get_prior(config):
+    """
+    이전 calibration 값이 있으면 적극 활용.
+    """
+
+    calibration = config.get(
+        "calibration",
+        {}
+    )
+
+    last = calibration.get(
+        "last_result",
+        {}
+    )
+
+    if "boundary_estimate_ms" in last:
+        return (
+            float(
+                last[
+                    "boundary_estimate_ms"
+                ]
+            ),
+            True,
+        )
+
+    if "effective_offset_ms" in config:
+        return (
+            float(
+                config[
+                    "effective_offset_ms"
+                ]
+            ),
+            True,
+        )
+
+    if "no_early_offset_ms" in config:
+        return (
+            float(
+                config[
+                    "no_early_offset_ms"
+                ]
+            ),
+            True,
+        )
+
+    return (
+        float(
+            calibration.get(
+                "default_guess_ms",
+                2000.0
+            )
+        ),
+        False,
+    )
+
+
+def read_server_time(call_ns):
+    """
+    명백한 오타를 잡기 위해
+    PC click과 30초 이상 차이나면 재입력.
+    """
+
+    while True:
+        value = input(
+            "웹페이지 서버 표시 시각 "
+            "(HH:MM:SS): "
+        ).strip()
+
+        try:
+            server_dt = (
+                closest_server_datetime(
+                    value,
+                    call_ns
+                )
+            )
+
+        except Exception:
+            print(
+                "형식 오류. 예: 15:03:07"
+            )
+            continue
+
+        click_dt = datetime.fromtimestamp(
             call_ns / 1e9
         )
 
-        return_dt = datetime.fromtimestamp(
-            return_ns / 1e9
+        diff = abs(
+            (
+                server_dt
+                - click_dt
+            ).total_seconds()
         )
 
-        writer.writerow([
-            trial,
-            target_dt.isoformat(
-                timespec="milliseconds"
-            ),
-            call_dt.isoformat(
-                timespec="milliseconds"
-            ),
-            return_dt.isoformat(
-                timespec="milliseconds"
-            ),
-            f"{(return_ns-call_ns)/1e6:.3f}",
-            server_hms,
-            f"{sample_low:.3f}",
-            f"{sample_high:.3f}",
-            (
-                f"{common_low:.3f}"
-                if common_low is not None
-                else ""
-            ),
-            (
-                f"{common_high:.3f}"
-                if common_high is not None
-                else ""
-            ),
-        ])
+        if diff > 30:
+            print()
+            print(
+                f"주의: click 시각과 "
+                f"{diff:.1f}초 차이납니다."
+            )
+            print(
+                "오타 가능성이 있으므로 "
+                "다시 입력해주세요."
+            )
+            continue
+
+        return value
 
 
-def run_one_trial(
-    trial,
-    fraction_ms,
-    spin_window_ms,
+def current_bracket(
+    safe_values,
+    early_values
 ):
-    print()
-    print("=" * 55)
-    print(f"TEST #{trial}")
-    print("=" * 55)
+    """
+    EARLY 관측을 보수적으로 우선한다.
 
-    input(
-        "Enter → 브라우저로 이동 → "
-        "실제 테스트 버튼 위에 마우스를 올려두세요: "
+    upper = 관측된 EARLY 중 가장 작은 threshold
+    lower = upper보다 작은 SAFE 중 가장 큰 threshold
+    """
+
+    if not safe_values:
+        return None
+
+    if not early_values:
+        return None
+
+    upper = min(
+        early_values
     )
 
-    target_ns = make_target_ns(
-        fraction_ms
+    valid_safe = [
+        value
+        for value in safe_values
+        if value < upper
+    ]
+
+    if not valid_safe:
+        return None
+
+    lower = max(
+        valid_safe
     )
 
-    target_dt = datetime.fromtimestamp(
-        target_ns / 1e9
+    return lower, upper
+
+
+def probe(
+    candidate_ms,
+    attempt,
+    max_attempts,
+    phase,
+    config,
+    beep_enabled,
+    countdown_seconds,
+):
+    prepare_seconds = float(
+        config.get(
+            "calibration",
+            {}
+        ).get(
+            "prepare_seconds",
+            5
+        )
+    )
+
+    spin_window_ms = float(
+        config.get(
+            "spin_window_ms",
+            20
+        )
     )
 
     print()
     print(
-        "PC 클릭 예정:",
+        "=" * 55
+    )
+
+    print(
+        f"[{attempt}/{max_attempts}] "
+        f"{phase}"
+    )
+
+    print(
+        f"candidate offset: "
+        f"{candidate_ms:.3f} ms"
+    )
+
+    input(
+        "Enter → 브라우저로 이동 → "
+        "테스트 버튼 위에 마우스를 두세요: "
+    )
+
+    # candidate가 서버 정수 초 경계에
+    # 위치하도록 local fraction 선택
+    fraction_ms = (
+        -candidate_ms
+    ) % 1000.0
+
+    target_wall_ns = (
+        future_wall_ns_with_fraction(
+            fraction_ms,
+            prepare_seconds
+        )
+    )
+
+    target_dt = datetime.fromtimestamp(
+        target_wall_ns / 1e9
+    )
+
+    print(
+        "PC click 목표:",
         target_dt.strftime(
             "%H:%M:%S.%f"
         )[:-3]
     )
 
-    wait_until_ns(
-        target_ns,
+    alarm_process = start_countdown(
+        target_wall_ns,
+        enabled=beep_enabled,
+        countdown_seconds=countdown_seconds,
+    )
+
+    result = precise_click(
+        target_wall_ns,
         spin_window_ms
     )
 
-    call_ns = time.time_ns()
+    cleanup_countdown(
+        alarm_process
+    )
 
-    try:
-        pyautogui.click()
-
-    except pyautogui.FailSafeException:
-        print("Fail-safe로 취소되었습니다.")
-        raise SystemExit
-
-    return_ns = time.time_ns()
+    call_ns = result["call_ns"]
 
     call_dt = datetime.fromtimestamp(
         call_ns / 1e9
-    )
-
-    return_dt = datetime.fromtimestamp(
-        return_ns / 1e9
     )
 
     print()
@@ -320,368 +336,547 @@ def run_one_trial(
     )
 
     print(
-        "click() 반환:",
-        return_dt.strftime(
-            "%H:%M:%S.%f"
-        )[:-3]
+        "trigger 오차:",
+        f"{result['trigger_error_ms']:+.3f} ms"
     )
 
     print(
-        "click() 소요:",
-        f"{(return_ns-call_ns)/1e6:.3f} ms"
+        "click() 함수 소요:",
+        f"{result['click_duration_ms']:.3f} ms"
     )
 
-    server_hms = input(
-        "\n웹페이지 서버 표시 시각 "
-        "(HH:MM:SS): "
-    ).strip()
+    server_hms = read_server_time(
+        call_ns
+    )
 
-    low, high = calculate_delay_interval(
+    (
+        safe,
+        threshold_ms,
+        _,
+    ) = classify_boundary(
+        candidate_ms,
         call_ns,
         server_hms
     )
 
-    print()
-    print(
-        "이번 effective delay 범위:"
-    )
-    print(
-        f"  {low:.3f}"
-        f" ~ {high:.3f} ms"
+    status = (
+        "SAFE"
+        if safe
+        else "EARLY"
     )
 
-    return (
-        target_ns,
-        call_ns,
-        return_ns,
-        server_hms,
-        low,
-        high,
+    print()
+    print(
+        f"판정: {status}"
     )
+
+    print(
+        "실제 probe threshold:",
+        f"{threshold_ms:.3f} ms"
+    )
+
+    append_log({
+        "attempt": attempt,
+        "phase": phase,
+        "candidate_ms":
+            f"{candidate_ms:.3f}",
+        "actual_threshold_ms":
+            f"{threshold_ms:.3f}",
+        "result": status,
+        "target_local":
+            target_dt.isoformat(
+                timespec="milliseconds"
+            ),
+        "click_call":
+            call_dt.isoformat(
+                timespec="milliseconds"
+            ),
+        "trigger_error_ms":
+            f"{result['trigger_error_ms']:.3f}",
+        "click_duration_ms":
+            f"{result['click_duration_ms']:.3f}",
+        "server_time": server_hms,
+    })
+
+    return safe, threshold_ms
 
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--no-beep",
+        action="store_true",
+        help="calibration countdown beep 끄기",
+    )
+
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="이전 calibration을 덜 신뢰하고 넓게 탐색",
+    )
+
+    args = parser.parse_args()
+
     config = load_config()
-    backup_config()
 
-    spin_window_ms = float(
-        config.get(
-            "spin_window_ms",
-            20
+    if CONFIG_PATH.exists():
+        shutil.copy2(
+            CONFIG_PATH,
+            BACKUP_PATH
+        )
+
+    prewarm_input()
+
+    calibration = config.get(
+        "calibration",
+        {}
+    )
+
+    max_attempts = int(
+        calibration.get(
+            "max_attempts",
+            8
         )
     )
 
-    print()
-    print("=" * 55)
-    print(" Course Clicker Calibration v2")
-    print("=" * 55)
-    print()
-    print("중요:")
-    print(
-        "- 반드시 실제 사용할 것과 동일한 "
-        "페이지/버튼/네트워크 환경에서 테스트"
-    )
-    print(
-        "- 기존 offset 값은 이번 측정에서는 사용하지 않음"
-    )
-    print(
-        "- 서버가 HH:MM:SS 형태로 표시한다고 가정"
-    )
-    print()
-    print(
-        f"기존 config는 {BACKUP_PATH.name}로 백업합니다."
+    # hard cap
+    max_attempts = min(
+        max_attempts,
+        8
     )
 
-    # 초기 probing 위치
-    baseline_fractions = [
-        100.0,
-        300.0,
-        500.0,
-        700.0,
-        900.0,
-    ]
+    target_gap_ms = float(
+        calibration.get(
+            "target_gap_ms",
+            2.0
+        )
+    )
 
-    common_low = None
-    common_high = None
+    guard_ms = float(
+        calibration.get(
+            "guard_ms",
+            0.5
+        )
+    )
 
-    samples = []
+    backoff_ms = float(
+        calibration.get(
+            "backoff_ms",
+            1.0
+        )
+    )
 
-    trial = 0
+    beep_enabled, countdown_seconds = (
+        get_alarm_settings(
+            config,
+            args.no_beep
+        )
+    )
 
-    # -----------------------------------
-    # Phase 1
-    # -----------------------------------
+    prior, has_prior = get_prior(
+        config
+    )
 
-    print()
-    print("PHASE 1: delay 안정성 확인")
+    if args.full:
+        has_prior = False
 
-    for fraction_ms in baseline_fractions:
-
-        trial += 1
-
-        result = run_one_trial(
-            trial,
-            fraction_ms,
-            spin_window_ms,
+    if has_prior:
+        step_ms = float(
+            calibration.get(
+                "quick_initial_step_ms",
+                8.0
+            )
         )
 
-        (
-            target_ns,
-            call_ns,
-            return_ns,
-            server_hms,
-            low,
-            high,
-        ) = result
-
-        samples.append(
-            (low, high)
+        print(
+            f"이전 calibration "
+            f"{prior:.3f} ms에서 시작합니다."
         )
 
-        if common_low is None:
-            common_low = low
-            common_high = high
-
-        else:
-            common_low = max(
-                common_low,
-                low
+    else:
+        step_ms = float(
+            calibration.get(
+                "full_initial_step_ms",
+                128.0
             )
-
-            common_high = min(
-                common_high,
-                high
-            )
-
-        append_csv(
-            trial,
-            target_ns,
-            call_ns,
-            return_ns,
-            server_hms,
-            low,
-            high,
-            common_low,
-            common_high,
         )
 
-        if common_low >= common_high:
-            print()
-            print("======================================")
-            print("CALIBRATION FAILED")
-            print("======================================")
-            print()
-            print(
-                "5회 측정에서 일정한 offset으로 "
-                "설명할 수 없는 결과가 나왔습니다."
-            )
-            print()
-            print(
-                "즉 네트워크/서버 처리 delay가 "
-                "측정 중 크게 변했거나,"
-            )
-            print(
-                "웹페이지가 보여주는 시각이 "
-                "실제 요청 도착 시각이 아닐 수 있습니다."
-            )
-            print()
-            print(
-                "이 경우 ms 단위 offset 보정값을 "
-                "자동 저장하지 않습니다."
-            )
-            print()
-            print(
-                f"원본 결과는 {CSV_PATH.name}에 저장됨"
-            )
+        print(
+            f"초기 추정값 "
+            f"{prior:.3f} ms에서 시작합니다."
+        )
 
-            return
-
-    print()
-    print("PHASE 1 통과")
     print()
     print(
-        "공통 delay 범위:"
+        f"최대 시도: {max_attempts}회"
     )
+
     print(
-        f"  {common_low:.3f}"
-        f" ~ {common_high:.3f} ms"
+        f"목표 boundary gap: "
+        f"{target_gap_ms:.1f} ms 이하"
     )
 
-    # -----------------------------------
-    # Phase 2
-    # -----------------------------------
+    print(
+        f"beep: "
+        f"{'ON' if beep_enabled else 'OFF'}"
+    )
 
-    print()
-    print("PHASE 2: 범위 정밀화")
+    safe_values = []
+    early_values = []
+
+    attempt = 0
+
+    # ========================================================
+    # Phase 1: bracket 찾기
+    # ========================================================
+
+    candidate = prior
+
+    attempt += 1
+
+    safe, threshold = probe(
+        candidate,
+        attempt,
+        max_attempts,
+        "INITIAL PROBE",
+        config,
+        beep_enabled,
+        countdown_seconds,
+    )
+
+    if safe:
+        safe_values.append(
+            threshold
+        )
+        direction = +1
+
+    else:
+        early_values.append(
+            threshold
+        )
+        direction = -1
+
+    current_candidate = candidate
+
+    # confirmation을 위해 최소 2회는 남겨둔다.
+    search_limit = (
+        max_attempts - 2
+    )
 
     while (
-        common_high - common_low
-        > TARGET_WIDTH_MS
-        and trial < MAX_TRIALS
+        current_bracket(
+            safe_values,
+            early_values
+        )
+        is None
+        and attempt < search_limit
     ):
-
-        fraction_ms = choose_next_fraction(
-            common_low,
-            common_high
+        next_candidate = (
+            current_candidate
+            + direction * step_ms
         )
 
-        trial += 1
+        attempt += 1
 
-        result = run_one_trial(
-            trial,
-            fraction_ms,
-            spin_window_ms,
+        safe, threshold = probe(
+            next_candidate,
+            attempt,
+            max_attempts,
+            "BRACKET SEARCH",
+            config,
+            beep_enabled,
+            countdown_seconds,
         )
 
-        (
-            target_ns,
-            call_ns,
-            return_ns,
-            server_hms,
-            low,
-            high,
-        ) = result
-
-        new_low = max(
-            common_low,
-            low
-        )
-
-        new_high = min(
-            common_high,
-            high
-        )
-
-        append_csv(
-            trial,
-            target_ns,
-            call_ns,
-            return_ns,
-            server_hms,
-            low,
-            high,
-            new_low,
-            new_high,
-        )
-
-        if new_low >= new_high:
-            print()
-            print("======================================")
-            print("JITTER DETECTED")
-            print("======================================")
-            print()
-            print(
-                "정밀화 과정에서 기존 범위와 "
-                "겹치지 않는 측정값이 나왔습니다."
+        if safe:
+            safe_values.append(
+                threshold
             )
-            print()
-            print(
-                "현재 환경에서는 delay가 "
-                "고정값이 아닐 가능성이 큽니다."
+        else:
+            early_values.append(
+                threshold
             )
+
+        bracket = current_bracket(
+            safe_values,
+            early_values
+        )
+
+        if bracket is not None:
+            break
+
+        # 아직 같은 방향이면 더 크게 이동
+        current_candidate = (
+            next_candidate
+        )
+
+        step_ms *= 2.0
+
+    bracket = current_bracket(
+        safe_values,
+        early_values
+    )
+
+    if bracket is None:
+        print()
+        print(
+            "SAFE/EARLY 경계를 "
+            "8회 예산 안에서 찾지 못했습니다."
+        )
+
+        print(
+            "환경 변화가 큰 경우 "
+            "`python calibrate.py --full`로 "
+            "다시 시도하세요."
+        )
+
+        return
+
+    low, high = bracket
+
+    # ========================================================
+    # Phase 2: boundary refinement
+    # ========================================================
+
+    while (
+        high - low > target_gap_ms
+        and attempt < search_limit
+    ):
+        candidate = (
+            low + high
+        ) / 2.0
+
+        attempt += 1
+
+        safe, threshold = probe(
+            candidate,
+            attempt,
+            max_attempts,
+            "BOUNDARY SEARCH",
+            config,
+            beep_enabled,
+            countdown_seconds,
+        )
+
+        if safe:
+            safe_values.append(
+                threshold
+            )
+        else:
+            early_values.append(
+                threshold
+            )
+
+        new_bracket = current_bracket(
+            safe_values,
+            early_values
+        )
+
+        if new_bracket is None:
             print()
             print(
-                "기존 config는 변경하지 않습니다."
+                "측정 결과에 jitter가 크게 "
+                "발생했습니다."
             )
             return
 
-        common_low = new_low
-        common_high = new_high
-
-        width = (
-            common_high
-            - common_low
-        )
+        low, high = new_bracket
 
         print()
         print(
-            "현재 공통 범위:"
+            "현재 boundary:",
+            f"{low:.3f}"
+            f" ~ {high:.3f} ms"
         )
+
         print(
-            f"  {common_low:.3f}"
-            f" ~ {common_high:.3f} ms"
-        )
-        print(
-            f"폭: {width:.3f} ms"
+            "gap:",
+            f"{high-low:.3f} ms"
         )
 
-    # -----------------------------------
-    # 저장
-    # -----------------------------------
+    # ========================================================
+    # Phase 3: no-early candidate
+    # ========================================================
 
-    estimate = (
-        common_low
-        + common_high
-    ) / 2
+    boundary_estimate = (
+        low + high
+    ) / 2.0
 
-    width = (
-        common_high
-        - common_low
+    # 가장 빠른 SAFE boundary보다
+    # 약간 더 보수적으로
+    final_offset = (
+        low - guard_ms
     )
+
+    print()
+    print("=" * 55)
+
+    print(
+        "검색 완료 boundary:",
+        f"{low:.3f}"
+        f" ~ {high:.3f} ms"
+    )
+
+    print(
+        "no-early 후보:",
+        f"{final_offset:.3f} ms"
+    )
+
+    # ========================================================
+    # Phase 4: 남은 budget으로 confirmation
+    # ========================================================
+
+    consecutive_safe = 0
+    confirmation_early = 0
+
+    while (
+        attempt < max_attempts
+        and consecutive_safe < 2
+    ):
+        attempt += 1
+
+        safe, threshold = probe(
+            final_offset,
+            attempt,
+            max_attempts,
+            "FINAL CONFIRMATION",
+            config,
+            beep_enabled,
+            countdown_seconds,
+        )
+
+        if safe:
+            consecutive_safe += 1
+
+        else:
+            confirmation_early += 1
+
+            # EARLY 발생 시 더 보수적으로 이동
+            final_offset = min(
+                final_offset,
+                threshold - backoff_ms
+            )
+
+            consecutive_safe = 0
+
+            print()
+            print(
+                "EARLY 관측 → offset을 "
+                f"{final_offset:.3f} ms로 "
+                "보수적으로 조정"
+            )
+
+    if consecutive_safe < 2:
+        print()
+        print(
+            "최종 후보를 2회 연속 SAFE로 "
+            "검증하지 못했습니다."
+        )
+
+        print(
+            "안전을 위해 config를 "
+            "업데이트하지 않습니다."
+        )
+
+        return
+
+    # ========================================================
+    # Save
+    # ========================================================
 
     config[
         "effective_offset_ms"
     ] = round(
-        estimate,
+        boundary_estimate,
         3
     )
 
-    config[
-        "offset_range_ms"
-    ] = [
-        round(common_low, 3),
-        round(common_high, 3),
-    ]
-
-    config[
-        "offset_range_width_ms"
-    ] = round(
-        width,
-        3
-    )
-
-    # no-early 정책용
     config[
         "no_early_offset_ms"
     ] = round(
-        common_low,
+        final_offset,
         3
     )
 
+    calibration["version"] = 4
+
+    calibration[
+        "last_result"
+    ] = {
+        "boundary_low_ms":
+            round(low, 3),
+
+        "boundary_high_ms":
+            round(high, 3),
+
+        "boundary_gap_ms":
+            round(
+                high - low,
+                3
+            ),
+
+        "boundary_estimate_ms":
+            round(
+                boundary_estimate,
+                3
+            ),
+
+        "no_early_offset_ms":
+            round(
+                final_offset,
+                3
+            ),
+
+        "attempts":
+            attempt,
+
+        "confirmation_early_count":
+            confirmation_early,
+
+        "calibrated_at":
+            datetime.now().isoformat(
+                timespec="seconds"
+            ),
+    }
+
     config[
-        "offset_calibrated_at"
-    ] = datetime.now().isoformat(
-        timespec="seconds"
-    )
+        "calibration"
+    ] = calibration
 
-    save_config(config)
+    save_config(
+        config
+    )
 
     print()
     print("=" * 55)
-    print("CALIBRATION COMPLETE")
+    print(" CALIBRATION COMPLETE")
     print("=" * 55)
-    print()
 
     print(
-        "delay range:",
-        f"{common_low:.3f}"
-        f" ~ {common_high:.3f} ms"
+        "boundary:",
+        f"{low:.3f}"
+        f" ~ {high:.3f} ms"
     )
 
     print(
-        "midpoint:",
-        f"{estimate:.3f} ms"
+        "boundary gap:",
+        f"{high-low:.3f} ms"
     )
 
-    print(
-        "range width:",
-        f"{width:.3f} ms"
-    )
-
-    print()
     print(
         "no-early offset:",
-        f"{common_low:.3f} ms"
+        f"{final_offset:.3f} ms"
+    )
+
+    print(
+        "총 시도:",
+        f"{attempt}/{max_attempts}"
+    )
+
+    print(
+        "최종 confirmation:",
+        "2 SAFE 연속"
     )
 
     print()
@@ -689,16 +884,7 @@ def main():
         "config.json 업데이트 완료"
     )
 
-    print(
-        "이전 config:",
-        BACKUP_PATH.name
-    )
-
-    print(
-        "측정 로그:",
-        CSV_PATH.name
-    )
-
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
